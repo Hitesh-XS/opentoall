@@ -21,6 +21,9 @@ SORT_OPTIONS = {
 # Number of issues per page in the explore view.
 PAGE_SIZE = 30
 
+# Number of contributors per page on the leaderboard.
+LEADERBOARD_PAGE_SIZE = 50
+
 # Fields needed by issue cards / explore list (avoid pulling full body blobs).
 ISSUE_LIST_FIELDS = (
     "id",
@@ -207,19 +210,23 @@ def profile_view(request, username):
 
 def leaderboard(request):
     country = request.GET.get("country", "").strip()
-    lb_key = cache_key("leaderboard", country or "all")
-    cached = cache_get(lb_key)
-    if cached is not None:
-        return HttpResponse(cached)
 
-    profiles = (
-        Profile.objects.select_related("user")
-        .annotate(total=Count("user__contributions"))
-        .filter(total__gt=0)
-        .order_by("-total")
-    )
-    if country:
-        profiles = profiles.filter(country__iexact=country)
+    # Cache only the computed rows (not rendered HTML), so the template is
+    # rendered per request. This also fixes #38 (anonymous navbar served to
+    # logged-in users) and means pagination doesn't need page in the key.
+    rows_key = cache_key("leaderboard", "rows", country.lower() or "all")
+    profiles = cache_get(rows_key)
+    if profiles is None:
+        qs = (
+            Profile.objects.select_related("user")
+            .annotate(total=Count("user__contributions"))
+            .filter(total__gt=0)
+            .order_by("-total", "pk")  # pk tiebreaker = stable ranking across pages
+        )
+        if country:
+            qs = qs.filter(country__iexact=country)
+        profiles = list(qs)  # no [:50] slice any more
+        cache_set(rows_key, profiles, CACHE_TTL)
 
     countries_key = cache_key("leaderboard", "countries")
     countries = cache_get(countries_key)
@@ -233,23 +240,37 @@ def leaderboard(request):
         )
         cache_set(countries_key, countries, CACHE_TTL)
 
-    profiles = list(profiles[:50])
-    top = profiles[0] if profiles else None
+    paginator = Paginator(profiles, LEADERBOARD_PAGE_SIZE)
+    # get_page() handles ?page=abc and out-of-range values safely.
+    page_obj = paginator.get_page(request.GET.get("page", "1"))
+    page_rows = list(page_obj.object_list)
 
-    response = render(
+    on_first_page = page_obj.number == 1
+    if on_first_page:
+        podium, rest = page_rows[:3], page_rows[3:]
+    else:
+        podium, rest = [], page_rows
+
+    # Rank of the row just before `rest` begins: 3 on page 1, 50 on page 2, ...
+    rest_offset = max(page_obj.start_index() - 1, 0) + (len(podium))
+
+    querystring = urlencode({"country": country}) if country else ""
+
+    return render(
         request,
         "core/leaderboard.html",
         {
-            "profiles": profiles,
-            "podium": profiles[:3],
-            "rest": profiles[3:],
-            "top": top,
+            "profiles": page_rows,
+            "podium": podium,
+            "rest": rest,
+            "rest_offset": rest_offset,
+            "top": profiles[0] if (profiles and on_first_page) else None,
+            "page_obj": page_obj,
+            "querystring": querystring,
             "countries": countries,
             "selected_country": country,
         },
     )
-    cache_set(lb_key, response.content, CACHE_TTL)
-    return response
 
 
 @require_http_methods(["GET", "HEAD"])

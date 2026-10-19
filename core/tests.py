@@ -273,3 +273,63 @@ def test_explore_clone_size_filter_pagination(client, max_size, htmx):
     assert response.context["page_obj"].number == 2
     assert len(response.context["page_obj"]) == 1
     assert b"Excluded boundary" not in response.content
+
+
+@pytest.mark.django_db
+def test_leaderboard_pagination(client, monkeypatch):
+    cache.clear()
+    # Small page size so we don't need 50+ users. The view reads this module
+    # constant at request time, so patching it works.
+    monkeypatch.setattr("core.views.LEADERBOARD_PAGE_SIZE", 2)
+
+    # lbuser{i} has i contributions. Odd i -> Ghana (1, 3, 5), even -> Nigeria (2, 4).
+    for i in range(1, 6):
+        user = User.objects.create_user(f"lbuser{i}")
+        profile = user.profile  # created by signal
+        profile.github_username = f"lbuser{i}"
+        profile.country = "Ghana" if i % 2 else "Nigeria"
+        profile.save()
+        Contribution.objects.bulk_create([
+            Contribution(
+                user=user, repo_full_name="a/b", title=f"pr{j}",
+                pr_url=f"https://example.com/{i}/{j}",
+            )
+            for j in range(i)
+        ])
+
+    url = reverse("leaderboard")
+
+    # Page 1: hero shown, highest contributor first, 2 rows.
+    r1 = client.get(url)
+    assert r1.status_code == 200
+    assert r1.context["page_obj"].number == 1
+    assert [p.github_username for p in r1.context["profiles"]] == ["lbuser5", "lbuser4"]
+    assert r1.context["top"].github_username == "lbuser5"
+
+    # Page 2: no hero, ranks continue from 3.
+    r2 = client.get(url, {"page": 2})
+    assert r2.status_code == 200
+    assert r2.context["top"] is None
+    assert r2.context["page_obj"].start_index() == 3
+    assert [p.github_username for p in r2.context["profiles"]] == ["lbuser3", "lbuser2"]
+
+    # Bad or out-of-range page numbers must not crash.
+    assert client.get(url, {"page": "abc"}).status_code == 200
+    assert client.get(url, {"page": 999}).status_code == 200
+
+    # Country filter: 3 Ghana profiles -> 2 pages, and every page link keeps ?country=Ghana.
+    r3 = client.get(url, {"country": "Ghana"})
+    assert r3.status_code == 200
+    assert r3.context["page_obj"].paginator.num_pages == 2
+    links = re.findall(r'href="([^"]+)"', r3.content.decode())
+    page_links = [link for link in links if "page=" in link]
+    assert page_links
+    for link in page_links:
+        query = parse_qs(urlsplit(unescape(link)).query)
+        assert query["country"] == ["Ghana"]
+
+    next_page = next(link for link in page_links if "page=2" in link)
+    r4 = client.get(url + "?" + urlsplit(unescape(next_page)).query)
+    assert r4.status_code == 200
+    assert r4.context["page_obj"].number == 2
+    assert [p.github_username for p in r4.context["profiles"]] == ["lbuser1"]
